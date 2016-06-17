@@ -1,0 +1,5 @@
+/*Address register base*/
+#define BCM2708_PERI_BASE	0x3F000000
+#define GPIO_BASE		(BCM2708_PERI_BASE + 0x00200000)
+#define BSC_SLAVE_BASE		(GPIO_BASE + 0x00014000)
+
