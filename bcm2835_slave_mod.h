@@ -14,10 +14,10 @@
 #define BSC_CR			0x0000000C	// Control register (used to configure i2c/spi operation)
 #define BSC_FR			0x00000010	// Flag register
 #define BSC_IFLS		0x00000014	// Interrupt FIFO level select register 
-#define BSC_IMSC		0x00000018	// Interupt mask set clear register
-#define BSC_RIS			0x0000001C	// Raw interupt status register
-#define BSC_MIS			0x00000020	// Masked interupt status register
-#define BSC_ICR			0x00000024	// Interupt clear register
+#define BSC_IMSC		0x00000018	// Interrupt mask set clear register
+#define BSC_RIS			0x0000001C	// Raw interrupt status register
+#define BSC_MIS			0x00000020	// Masked interrupt status register
+#define BSC_ICR			0x00000024	// Interrupt clear register
 #define BSC_DMACR		0x00000028	// DMA control register (not supported)
 #define	BSC_TDR			0x0000002C	// FIFO test data register
 #define BSC_GPUSTAT		0x00000030	// GPU status register
