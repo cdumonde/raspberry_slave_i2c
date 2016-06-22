@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/wait.h>
 
 #include "bsc-slave.h"
@@ -22,41 +23,158 @@
 #define IRQ_DESC	"i2c-slave-irq"
 #define DEVICE_NAME	"i2c-slave"
 #define DRV_NAME	"i2c-slave-controller"
+#define MAX_DEVICES	1
+#define MINOR_MIN	0
 #define BUFFER_SIZE	PAGE_SIZE
 #define IRQ_NUMBER	73
 
 #define DEVICE_SLV_ADD	0x33
 
-struct circ_buff {
-	size_t size;
-	unsigned long volatile head;
-	unsigned long volatile tail;
-}
-
-struct bcm2835_i2c_slave_struct {
-       void __iomem	*base;
-       int		irq;
-       struct cdev	cdev;
-       dev_t		dev_number;
-       struct circ_buff	rx_buff;
-       struct circ_buff tx_buff;	
+struct bcm2835_i2c_slave {
+	void __iomem	*base;
+	int		irq;
+	struct cdev	cdev;
+	dev_t		dev_number;
+	struct circ_buff	rx_buff;
+	struct circ_buff tx_buff;
 } *i2c_slave_dev;
 
+static struct class *i2c_slave_class;
+static struct device *i2c_slave_device;
+
 static struct file_operations i2c_slave_fops = {
-        .owner          =  THIS_MODULE,
-        .open           =  i2c_slave_open,
-        .release        =  i2c_slave_release,
-        .read           =  i2c_slave_read,
-        .write          =  i2c_slave_write,
-        .unlocked_ioctl =  i2c_slave_ioctl,
+	.owner		= THIS_MODULE,
+	.open		= i2c_slave_open,
+	.release	= i2c_slave_release,
+	.read		= i2c_slave_read,
+	.write		= i2c_slave_write,
+	.unlocked_ioctl	= i2c_slave_ioctl,
 };
 
-int __init bcm2835_i2c_slave_init(void) {
+/*Init module*/
 
+int __init bcm2835_i2c_slave_init(void)
+{
+
+	int res = -ENODEV;
+	u32 reg = 0;
+	dev_t dev_number;
+	struct bcm2835_i2c_slave *i2c_slave;
+	
+	res = alloc_chrdev_region(&dev_number, MINOR_MIN, MAX_DEVICES, DEVICE_NAME)
+	if (res < 0) {
+		printk(KERN_ERR "The memory allocation failed for i2c-slave\n");
+		goto allocation_fail;
+	}
+
+	i2c_slave_class = class_create(THIS_MODULE, DEVICE_NAME);
+	if (IS_ERR(i2c_slave_class)) {
+		printk(KERN_ERR "The class creation failed\n");
+		goto class_fail;
+	}
+	
+	i2c_slave = kmalloc(sizeof(struct bcm2835_i2c_slave), GFP_KERNEL);
+	if (i2c_slave == NULL) {
+		res = -ENOMEM;
+		printk(KERN_ERR "Can't allocate memory for device structure\n");
+		goto mem_fail;
+	}
+
+
+
+	/*********************************************************************************************************************************/
+	
+	
+	if (request_mem_region(BSC_SLAVE_BASE, 64, DEVICE_NAME) == NULL) {
+		res = -EIO;
+		printk("i2c-slave: I/O Port 0x%x is not free!\n", BSC_SLAVE_BASE);
+		goto mem_reg_fail;
+  	}
+
+	i2c_slave->dev_number = MKDEV(major, 0);
+	cdev_init(&i2c_slave->cdev, &i2c_slave_fops);
+	res = cdev_add(&i2c_slave->cdev, i2c_slave->dev_number,1);
+	if (res) {
+		goto cdev_init_fail;
+		}
+		
+	i2c_slave_device = device_create(i2c_slave_class, NULL, i2c_slave->dev_number, i2c_slave, DEVICE_NAME);
+	if (IS_ERR(i2c_slave_device)) {
+		printk(KERN_NOTICE "C'ant create device in sysfs!\n");
+		goto dev_create_fail;
+		}
+	
+	bcm2708_init_i2c_pinmode(1);
+	res = request_irq(IRQ_NUMBER, i2c_slave_irq, 0, DEVICE_NAME, i2c_slave);
+	if (res) {
+		printk(KERN_NOTICE "could not request IRQ: %d!\n", ret);
+     		goto irq_fail;
+     	}
+     	
+     	i2c_slave->irq = IRQ_NUMBER;
+     	i2c_slave->base = ioremap(BSC_SLAVE_BASE, SZ_256-1);  //is size right???
+     	if (!i2c_slave->base) {
+     		printk(KERN_NOTICE "could not remap memory!\n");
+		goto remap_fail;
+     	}
+     	
+     	printk(KERN_NOTICE "i2c-slave at 0x%08lx (irq %d)\n", (unsigned long)BSC_SLAVE_BASE, IRQ_NUMBER);
+     	i2c_slave_dev = i2c_slave;
+     	
+	i2c_slave->rx_buf = __get_free_pages(GFP_KERNEL, 0);
+	if (IS_ERR((void *)i2c_slave->rx_buf)) {
+		resurn -ENOMEM;
+	}
+
+	i2c_slave->rx_buf_head = i2c_slave->rx_buf;
+	i2c_slave->rx_buf_tail = i2c_slave->rx_buf;
+	i2c_slave->tx_buf = __get_free_pages(GFP_KERNEL, 0);
+	if (IS_ERR((void *)i2c_slave->tx_buf)) {
+		resurn -ENOMEM;
+	}
+	
+	i2c_slave->tx_buf_head = i2c_slave->tx_buf;
+	i2c_slave->tx_buf_tail = i2c_slave->tx_buf;
+	writel(BSC_IFLS_TX2_RX4BYTE, i2c_slave->base + BSC_IFLS);
+	reg = BSC_IMSC_RXIM | BSC_IMSC_TXIM;
+	writel(reg, i2c_slave->base + BSC_IMSC);
+	writel(0, i2c_slave->base + BSC_RSR);
+	reg = BSC_CR_BRK;
+	writel(reg, i2c_slave->base + BSC_CR);
+	reg = (BSC_CR_EN | BSC_CR_I2C | BSC_CR_TXE | BSC_CR_RXE);
+	writel(reg, i2c_slave->base + BSC_CR);
+	resurn 0;
+	
+	remap_fail:
+		free_irq(IRQ_NUMBER, i2c_slave_dev);
+	irq_fail:
+		device_destroy(i2c_slave_class, MKDEV(major,0));
+		bcm2708_init_i2c_pinmode(0);
+	dev_create_fail:
+		cdev_del(&i2c_slave->cdev);
+	cdev_init_fail:
+		release_mem_region(BSC_SLAVE_BASE, 64);
+	mem_reg_fail:
+		kfree(i2c_slave);
+	mem_fail:
+		class_destroy(i2c_slave_class);
+	class_fail:
+		unregister_chrdev_region(dev_number, MAX_DEVICES);
+	resurn res;
 }
 
 void __exit bcm2708_i2c_slave_cleanup(void) {
 
+	printk(KERN_NOTICE "i2c-slave module removed!\n");
+	device_destroy(i2c_slave_class, MKDEV(major,0));
+	class_destroy(i2c_slave_class);
+	unregister_chrdev_region(MKDEV(major, 0), MAX_DEVICES);
+	cdev_del(&i2c_slave_dev->cdev);
+	release_mem_region(BSC_SLAVE_BASE, 64);
+	bcm2708_init_i2c_pinmode(0);
+	free_irq(IRQ_NUMBER, i2c_slave_dev);
+	iounmap(i2c_slave_dev->base);
+	kfree(i2c_slave_dev);
 }
 
 module_init(bcm2835_i2c_slave_init);

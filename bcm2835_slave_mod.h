@@ -86,7 +86,7 @@
 #define BSC_IMSC_RXIM		0x00000001	// Receive interrupt mask
 
 /*Masked interrupt status register mask*/
-#define BSC_MIS OEMIS		0x00000008	// Overrun error masked interrupt status
+#define BSC_MIS_OEMIS		0x00000008	// Overrun error masked interrupt status
 #define BSC_MIS_BEMIS		0x00000004	// Break error masked interrupt status
 #define BSC_MIS_TXMIS		0x00000002	// Transmit masked interrupt status
 #define BSC_MIS_RXMIS		0x00000001	// Receive masked interrupt status
