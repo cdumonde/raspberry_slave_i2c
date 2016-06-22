@@ -25,6 +25,7 @@
 #define DRV_NAME	"i2c-slave-controller"
 #define MAX_DEVICES	1
 #define MINOR_MIN	0
+#define BSC_SLV_SIZE	64
 #define BUFFER_SIZE	PAGE_SIZE
 #define IRQ_NUMBER	73
 
@@ -56,19 +57,23 @@ static struct file_operations i2c_slave_fops = {
 int __init bcm2835_i2c_slave_init(void)
 {
 
-	int res = -ENODEV;
+	int res;
 	u32 reg = 0;
 	dev_t dev_number;
 	struct bcm2835_i2c_slave *i2c_slave;
 	
 	res = alloc_chrdev_region(&dev_number, MINOR_MIN, MAX_DEVICES, DEVICE_NAME)
 	if (res < 0) {
+		res = ENODEV;
+		printk(KERN_ERR "bcm2835_slave_mod - line %d - Operation failed because of : ", __LINE__);
 		printk(KERN_ERR "The memory allocation failed for i2c-slave\n");
 		goto allocation_fail;
 	}
 
 	i2c_slave_class = class_create(THIS_MODULE, DEVICE_NAME);
 	if (IS_ERR(i2c_slave_class)) {
+		res = PTR_ERR(i2c_slave_call);
+		printk(KERN_ERR "bcm2835_slave_mod - line %d - Operation failed because of : ", __LINE__);
 		printk(KERN_ERR "The class creation failed\n");
 		goto class_fail;
 	}
@@ -76,44 +81,48 @@ int __init bcm2835_i2c_slave_init(void)
 	i2c_slave = kmalloc(sizeof(struct bcm2835_i2c_slave), GFP_KERNEL);
 	if (i2c_slave == NULL) {
 		res = -ENOMEM;
-		printk(KERN_ERR "Can't allocate memory for device structure\n");
+		printk(KERN_ERR "bcm2835_slave_mod - line %d - Operation failed because of : ", __LINE__);
+		printk(KERN_ERR "The memory allocation for device structure\n");
 		goto mem_fail;
+	}	
+	
+	if (request_mem_region(BSC_SLAVE_BASE, BSC_SLV_SIZE, DEVICE_NAME) == NULL) {
+		res = -EIO;
+		printk(KERN_ERR "bcm2835_slave_mod - line %d - Operation failed because of : ", __LINE__);
+		printk(KERN_ERR "I/O Port 0x%x is used by another process, can't reserve it to i2c-slave module\n", BSC_SLAVE_BASE);
+		goto mem_reg_fail;
 	}
 
-
-
-	/*********************************************************************************************************************************/
-	
-	
-	if (request_mem_region(BSC_SLAVE_BASE, 64, DEVICE_NAME) == NULL) {
-		res = -EIO;
-		printk("i2c-slave: I/O Port 0x%x is not free!\n", BSC_SLAVE_BASE);
-		goto mem_reg_fail;
-  	}
-
-	i2c_slave->dev_number = MKDEV(major, 0);
+	i2c_slave->dev_number = MKDEV(MAJOR(dev_number), 0);
 	cdev_init(&i2c_slave->cdev, &i2c_slave_fops);
-	res = cdev_add(&i2c_slave->cdev, i2c_slave->dev_number,1);
+	res = cdev_add(&i2c_slave->cdev, i2c_slave->dev_number, 1);
 	if (res) {
+		printk(KERN_ERR "bcm2835_slave_mod - line %d - Operation failed because of : ", __LINE__);
+		printk(KERN_ERR "The addition of i2c-slave device to the system failed\n");
 		goto cdev_init_fail;
-		}
+	}
 		
 	i2c_slave_device = device_create(i2c_slave_class, NULL, i2c_slave->dev_number, i2c_slave, DEVICE_NAME);
 	if (IS_ERR(i2c_slave_device)) {
-		printk(KERN_NOTICE "C'ant create device in sysfs!\n");
+		res = PTR_ERR(i2c_slave_device);
+		printk(KERN_ERR "bcm2835_slave_mod - line %d - Operation failed because of : ", __LINE__);
+		printk(KERN_ERR "The creation and/or registration of i2c-slave device failed\n");
 		goto dev_create_fail;
-		}
+	}
 	
-	bcm2708_init_i2c_pinmode(1);
-	res = request_irq(IRQ_NUMBER, i2c_slave_irq, 0, DEVICE_NAME, i2c_slave);
+	bcm2708_init_i2c_pinmode(TRUE);
+	
+	res = request_irq(IRQ_NUMBER, i2c_callback_func, 0, DEVICE_NAME, i2c_slave);
 	if (res) {
-		printk(KERN_NOTICE "could not request IRQ: %d!\n", ret);
+		printk(KERN_ERR "bcm2835_slave_mod - line %d - Operation failed because of : ", __LINE__);
+		printk(KERN_ERR "Requesting IRQ %d failed, maybe it is already used\n", IRQ_NUMBER);
      		goto irq_fail;
      	}
      	
      	i2c_slave->irq = IRQ_NUMBER;
      	i2c_slave->base = ioremap(BSC_SLAVE_BASE, SZ_256-1);  //is size right???
      	if (!i2c_slave->base) {
+     		printk(KERN_ERR "bcm2835_slave_mod - line %d - Operation failed because of : ", __LINE__);
      		printk(KERN_NOTICE "could not remap memory!\n");
 		goto remap_fail;
      	}
