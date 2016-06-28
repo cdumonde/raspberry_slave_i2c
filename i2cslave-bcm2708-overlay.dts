@@ -1,0 +1,65 @@
+/*
+ * Device tree overlay for i2c_bcm2708, i2cslave bus
+ *
+ * Compile:
+ * dtc -@ -I dts -O dtb -o i2cslave-bcm2708-overlay.dtbo i2cslave-bcm2708-overlay.dts
+ */
+
+/dts-v1/;
+/plugin/;
+
+/{
+	compatible = "brcm,bcm2707", "brcm,bcm2708", "brcm,bcm2709", "brcm,bcm2835";
+
+	fragment@0{
+		target = <&soc>;
+		__overlay__ {
+			i2cslv0: i2c@7e214000 {
+			compatible = "brcm,bcm2835-i2c-slave";
+			reg = <0x7e214000 0x1000>;
+			interrupts = <2 11>;
+			clocks = <&clk_core>;
+			clock-frequency = <100000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			pinctrl-names = "default";
+         		pinctrl-0 = <&i2cslv0_pins>;
+			status = "okay";
+			};
+		};
+	};
+	
+	fragment@1{
+		target = <&gpio>;
+		__overlay__{
+			i2cslv0_pins: i2cslv0 {
+				brcm,pins = <18 19>;
+            			brcm,function = <7>; /* alt3 */	
+			};
+		};
+	};
+	
+	fragment@2{
+		target-path = "/aliases";
+		__overlay__{
+			i2cslv0 = "/soc/i2c@7e214000";
+		};
+	};
+	
+	fragment@3{
+		target-path = "/__symbols__";
+		__overlay__{
+			i2cslv0 = "/soc/i2c@7e214000";
+			i2cslv0_pins = "/soc/gpio@7e200000/i2cslv0";
+		};
+	};
+
+
+
+
+
+
+
+
+
+};

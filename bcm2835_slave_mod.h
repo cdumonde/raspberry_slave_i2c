@@ -1,6 +1,4 @@
 /*Address register base*/
-#define GPIO_BASE		0x3F200000	// G0PIO registers base addresses
-#define I2C_SPI_SLV_BASE	0x3F214000	// BSC/SPI slave registers base addresses
 #define I2C_SPI_FIFOS_BASE	0x3F204000	// BSC/SPI FIFOS registers base addresses
 
 /*FIFO register mask*/
