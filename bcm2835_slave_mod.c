@@ -11,15 +11,25 @@
 #include <linux/interrupt.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
+#include <linux/circ_buf.h>
 #include "bcm2835_slave_mod.h"
 
 #define I2C_WAIT_LOOP_COUNT	200
-#define SLV_ADDRESS			0x33
+#define SLV_ADDRESS		0x42
 #define DRV_NAME		"bcm2835_i2c_slave"
+
+#define READ( __bcm2835_i2c_slave__, __reg__ ) readl( __bcm2835_i2c_slave__->base + __reg__)
+#define WRITE( __bcm2835_i2c_slave__, __reg__ , __val__) writel( __val__, __bcm2835_i2c_slave__->base + __reg__)
+
+#define DEBUG 1
 
 static unsigned int baudrate;
 module_param(baudrate, uint, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(baudrate, "The I2C baudrate");
+
+static unsigned char slave_add = SLV_ADDRESS;
+module_param(slave_add, uchar, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(slave_add, "The I2C Slave address");
 
 static bool combined = false;
 module_param(combined, bool, 0644);
@@ -37,95 +47,28 @@ struct bcm2835_i2c_slave {
 
 	struct completion done;
 
-	struct i2c_msg *msg;
+	struct i2c_msg *msg;	
 	int pos;
 	int nmsgs;
 	bool error;
 };
 
-static inline u32 bcm2835_rd(struct bcm2835_i2c_slave  *bi, unsigned reg)
+static inline void debug_bsc_slave_register(struct bcm2835_i2c_slave *bi)
 {
-	return readl(bi->base + reg);
-}
-
-static inline void bcm2835_wr(struct bcm2835_i2c_slave  *bi, unsigned reg, u32 val)
-{
-	writel(val, bi->base + reg);
-}
-
-static inline void bcm2835_bsc_slave_reset(struct bcm2835_i2c_slave  *bi)
-{
-	bcm2835_wr(bi, BSC_CR, 0);
-	bcm2835_wr(bi, BSC_SLV, 0);
-}
-
-static inline void bcm2835_bsc_slave_fifo_drain(struct bcm2835_i2c_slave  *bi)
-{
-	while (!(bcm2835_rd(bi, BSC_FR) & BSC_FR_RXFE) && (bi->pos < bi->msg->len))
-		bi->msg->buf[bi->pos++] = bcm2835_rd(bi, BSC_DR) & BSC_DR_DATA_MASK;
-}
-
-static inline void bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave  *bi)
-{
-	while (!(bcm2835_rd(bi, BSC_FR) & BSC_FR_TXFE) && (bi->pos < bi->msg->len))
-		bcm2835_wr(bi, BSC_DR, bi->msg->buf[bi->pos++]);
-}
-
-static inline int bcm2835_bsc_slave_setup(struct bcm2835_i2c_slave  *bi)
-{
-	int reg;
-	u32 cdiv, clk_tout;
-	u32 c = BSC_CR_I2C | BSC_CR_RXE | BSC_CR_TXE | BSC_CR_EN;
-	cdiv = bi->cdiv;
-	clk_tout = bi->clk_tout;
-	
-
-	bcm2835_wr(bi, BSC_IFLS, 0);//TODO 
-	bcm2835_wr(bi, BSC_IMSC, BSC_IMSC_RXIM | BSC_IMSC_TXIM);
-	bcm2835_wr(bi, BSC_RSR, 0);
-	bcm2835_wr(bi, BSC_SLV, SLV_ADDRESS);
-	bcm2835_wr(bi, BSC_CR, c);
-	
-
-
-	//DEBUG
-	reg = bcm2835_rd(bi, BSC_SLV);
+	reg = READ(bi, BSC_SLV);
 	printk( KERN_INFO "Slave Address: 0x%x\n", reg);
 
-	reg = bcm2835_rd(bi, BSC_CR);
-	printk( KERN_INFO "CR: 0x%x\n", reg);
-
-	if ((reg & BSC_CR_BRK) != 0)
-		printk( KERN_INFO "Break Enabled (I2C TX functions disabled)\n");
-	else
-		printk( KERN_INFO "Break Disabled (I2C TX Fucntions enabled)\n");
-
-	if ((reg & BSC_CR_RXE) != 0)
-		printk( KERN_INFO "Receive Mode Enabled (Only affects SPI?)\n");
-	else
-		printk( KERN_INFO "Receive Mode Disabled (Only affects SPI?)\n");
-
-	if ((reg & BSC_CR_TXE) != 0)
-		printk( KERN_INFO "Transmit mode enabled\n");
-	else
-		printk( KERN_INFO "Transmit mode disabled\n");
-
-	if ((reg & BSC_CR_I2C) != 0)
-		printk( KERN_INFO "I2C Mode enabled\n");
-	else
-		printk( KERN_INFO "I2C mode disabled\n");
-
-	if ((reg & BSC_CR_SPI) != 0)
-		printk( KERN_INFO "SPI Mode enabled\n");
-	else
-		printk( KERN_INFO "SPI mode disabled\n");
-
-	if ((reg & BSC_CR_EN) != 0)
-		printk( KERN_INFO "Device Enabled\n");
-	else
-		printk( KERN_INFO "Device Disabled\n");
-
-	reg = bcm2835_rd(bi, BSC_FR);
+	reg = READ(bi, BSC_CR);
+	printk( KERN_INFO "Control Register value: 0x%x\n", reg);
+	
+	printk( KERN_INFO "Break %s (I2C TX functions %s)\n", (reg & BSC_CR_BRK) ? "Enabled" : "Disabled", (reg & BSC_CR_BRK) ? "disabled" : "enabled");
+	printk( KERN_INFO "Receive Mode %s (Only affects SPI?)\n", (reg & BSC_CR_RXE) ? "Enabled" : "Disabled");
+	printk( KERN_INFO "Transmit mode %s\n", (reg & BSC_CR_TXE) ? "enabled" : "disabled");
+	printk( KERN_INFO "I2C Mode %s\n", (reg & BSC_CR_I2C) ? "enabled" : "disabled");
+	printk( KERN_INFO "SPI Mode %s\n", (reg & BSC_CR_SPI) ? "enabled" : "disabled");
+	printk( KERN_INFO "Device Enabled\n", (reg & BSC_CR_EN) ? "Enabled" : "Disabled");
+	
+	reg = READ(bi, BSC_FR);
 	printk( KERN_INFO "FR: 0x%x\n", reg);
 
 	printk( KERN_INFO "RX FIFO Level: 0x%x\n", (reg & 0xf800) / 2048);
@@ -133,85 +76,95 @@ static inline int bcm2835_bsc_slave_setup(struct bcm2835_i2c_slave  *bi)
 	
 	if ((reg & BSC_FR_TXFE) != 0)
 		printk( KERN_INFO "TX Fifo Empty\n");
-	if ((reg & BSC_FR_RXFF) != 0)
-		printk( KERN_INFO "RX Fifo full\n");
-	if ((reg & BSC_FR_TXFF) != 0)
+	else if ((reg & BSC_FR_TXFF) != 0)
 		printk( KERN_INFO "TX Fifo full\n");
 	if ((reg & BSC_FR_RXFE) != 0)
 		printk( KERN_INFO "RX Fifo Empty\n");
-	if ((reg & BSC_FR_TXBUSY) != 0)
-		printk( KERN_INFO "Transmit operation in progress.\n");
-	else
-		printk( KERN_INFO "Transmit inactive.\n");
+	else if ((reg & BSC_FR_RXFF) != 0)
+		printk( KERN_INFO "RX Fifo full\n");
+		
+	printk( KERN_INFO "Transmit %s.\n", (reg & BSC_CR_EN) ? "operation in progress" : "inactive");
 
-	reg = bcm2835_rd(bi, BSC_IFLS);
+	reg = READ(bi, BSC_IFLS);
 	printk( KERN_INFO "IFLS: 0x%x\n", reg);
 
 	printk( KERN_INFO "RX FIFO Interrupt trigger: 0x%x\n", (reg & 0x0038) / 8);
 	printk( KERN_INFO "TX FIFO interrupt trigger: 0x%x\n", (reg & 0x7));
 
-	reg = bcm2835_rd(bi, BSC_IMSC);
+	reg = READ(bi, BSC_IMSC);
 	printk( KERN_INFO "IMSC: 0x%x\n", reg);
 
-	reg = bcm2835_rd(bi, BSC_RIS);
+	reg = READ(bi, BSC_RIS);
 	printk( KERN_INFO "RIS: 0x%x\n", reg);
 
-	reg = bcm2835_rd(bi, BSC_MIS);
+	reg = READ(bi, BSC_MIS);
 	printk( KERN_INFO "MIS: 0x%x\n", reg);
 
-	reg = bcm2835_rd(bi, BSC_ICR);
+	reg = READ(bi, BSC_ICR);
 	printk( KERN_INFO "ICR: 0x%x\n", reg);
-	return 0;
+}
+
+static inline void bcm2835_bsc_slave_reset(struct bcm2835_i2c_slave *bi)
+{
+	WRITE(bi, BSC_CR, 0);
+	WRITE(bi, BSC_SLV, 0);
+}
+
+static inline void bcm2835_bsc_slave_fifo_drain(struct bcm2835_i2c_slave *bi)
+{
+	while (!(READ(bi, BSC_FR) & BSC_FR_RXFE) && (bi->pos < bi->msg->len))
+		bi->msg->buf[bi->pos++] = READ(bi, BSC_DR) & BSC_DR_DATA_MASK;
+}
+
+static inline void bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave  *bi)
+{
+	while (!(READ(bi, BSC_FR) & BSC_FR_TXFE) && (bi->pos < bi->msg->len))
+		WRITE(bi, BSC_DR, bi->msg->buf[bi->pos++]);
+}
+
+static inline int bcm2835_bsc_slave_setup(struct bcm2835_i2c_slave *bi)
+{
+	int reg;
+	u32 c = BSC_CR_I2C | BSC_CR_RXE | BSC_CR_TXE | BSC_CR_EN;
+	
+	WRITE(bi, BSC_IFLS, ((BSC_IFLS_ONE_EIGHTS << 3) & BSC_IFLS_RXIFLSEL) | (BSC_IFLS_ONE_EIGHTS & BSC_IFLS_TXIFLSEL));
+	WRITE(bi, BSC_IMSC, BSC_IMSC_RXIM | BSC_IMSC_TXIM);
+	WRITE(bi, BSC_RSR, 0);
+	WRITE(bi, BSC_SLV, SLV_ADDRESS);
+	WRITE(bi, BSC_CR, c);	
+	
+	#ifdef DEBUG
+	debug_bsc_slave_register(bi);
+	#endif
 }
 
 static irqreturn_t bcm2835_i2c_slave_interrupt(int irq, void *dev_id)
 {
 	u32 reg, stat_reg;
-	struct bcm2835_i2c_slave *i2c_slave = dev_id;
+	struct bcm2835_i2c_slave *bi = dev_id;
    	int tx_value_count;
 
-	spin_lock(&i2c_slave->lock);
-   	stat_reg = readl(i2c_slave->base + BSC_MIS);      //interrupt status reg
+	spin_lock(&bi->lock);
+   	stat_reg = READ(bi, BSC_MIS);      //interrupt status reg
                                                      // clear error register
- 	writel(0, i2c_slave->base + BSC_RSR);
+ 	WRITE(bi, BSC_RSR, 0);
 	printk( KERN_INFO "irq mis en place\n");
-   	if(stat_reg & BSC_MIS_RXMIS){
-	printk( KERN_INFO "interruption detectee sur RX\n");
-                                                //while RX_FIFO not empty
-    		while( !((reg = readl(i2c_slave->base + BSC_FR)) & BSC_FR_RXFE) ){
-			printk( KERN_INFO "remplissage du buffer\n");
-			reg = readl(i2c_slave->base + BSC_DR);       //read RX_FIFO
-  		}
+   	if(stat_reg & BSC_MIS_RXMIS) {
+		printk( KERN_INFO "interruption detectee sur RX\n");
+		bcm2835_bsc_slave_fifo_drain(struct bcm2835_i2c_slave *bi);    		
    	}
-
 
 	if(stat_reg & BSC_MIS_TXMIS){
 
 		printk( KERN_INFO "interruption detectee sur TX\n");
- 		tx_value_count = 0;
-
-     		if(tx_value_count == 0){                        //no data to send
-
-          		reg = readl(i2c_slave->base + BSC_IMSC);
-          		reg &= ~(BSC_IMSC_TXIM);                   //disable TX interruts
-          		writel(reg ,i2c_slave->base + BSC_IMSC);
-     		}
-
-     		reg = readl(i2c_slave->base + BSC_FR);
-                                               //while space in TX FIFO
-	 	while (((!(reg & BSC_FR_TXFF)) && (tx_value_count != 0))){
-		printk( KERN_INFO "remplissage du buffer\n");
-		 reg = readl(i2c_slave->base + BSC_FR);
-	 	}
- 
+ 		bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave *bi); 
   	}
 	spin_unlock(&i2c_slave->lock);
 
    return IRQ_HANDLED;
 }
 
-static int bcm2835_i2c_slave_master_xfer(struct i2c_adapter *adap,
-	struct i2c_msg *msgs, int num)
+static int bcm2835_i2c_slave_master_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 {
 	struct bcm2835_i2c_slave *bi = adap->algo_data;
 	unsigned long flags;
@@ -247,7 +200,6 @@ static int bcm2835_i2c_slave_master_xfer(struct i2c_adapter *adap,
 
 error_timeout:
 	spin_lock_irqsave(&bi->lock, flags);
-	//bcm2835_bsc_slave_reset(bi);
 	bi->msg = 0; /* to inform the interrupt handler that there's nothing else to be done */
 	bi->nmsgs = 0;
 	spin_unlock_irqrestore(&bi->lock, flags);
@@ -256,7 +208,7 @@ error_timeout:
 
 static u32 bcm2835_i2c_slave_functionality(struct i2c_adapter *adap)
 {
-	return I2C_FUNC_I2C | /*I2C_FUNC_10BIT_ADDR |*/ I2C_FUNC_SMBUS_EMUL;
+	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
 }
 
 static struct i2c_algorithm bcm2835_i2c_slave_algorithm = {
@@ -326,22 +278,7 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	adap->nr = pdev->id;
 	strlcpy(adap->name, dev_name(&pdev->dev), sizeof(adap->name));
 	adap->dev.of_node = pdev->dev.of_node;
-
-	switch (pdev->id) {
-	case 0:
-		adap->class = I2C_CLASS_HWMON;
-		break;
-	case 1:
-		adap->class = I2C_CLASS_DDC;
-		break;
-	case 2:
-		adap->class = I2C_CLASS_DDC;
-		break;
-	default:
-		dev_err(&pdev->dev, "can only bind to BSC 0, 1 or 2\n");
-		err = -ENXIO;
-		goto out_free_bi;
-	}
+	adap->class = I2C_CLASS_HWMON;
 
 	spin_lock_init(&bi->lock);
 	init_completion(&bi->done);
@@ -401,7 +338,7 @@ out_clk_put:
 	clk_put(clk);
 	return err;
 }
-//////////////////////////////////////////////////////////////////////
+
 static int bcm2835_i2c_slave_remove(struct platform_device *pdev)
 {
 	struct bcm2835_i2c_slave *bi = platform_get_drvdata(pdev);
@@ -436,7 +373,6 @@ static struct platform_driver bcm2835_i2c_slave_driver = {
 
 static int __init bcm2835_i2c_slave_init(void)
 {	
-	printk(KERN_INFO "\n OK \n");
 	return platform_driver_register(&bcm2835_i2c_slave_driver);
 }
 
