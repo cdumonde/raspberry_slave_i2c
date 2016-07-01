@@ -27,8 +27,8 @@ static unsigned int baudrate;
 module_param(baudrate, uint, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(baudrate, "The I2C baudrate");
 
-static unsigned char slave_add = SLV_ADDRESS;
-module_param(slave_add, uchar, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+static unsigned int slave_add = SLV_ADDRESS;
+module_param(slave_add, uint, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(slave_add, "The I2C Slave address");
 
 static bool combined = false;
@@ -36,14 +36,12 @@ module_param(combined, bool, 0644);
 MODULE_PARM_DESC(combined, "Use combined transactions");
 
 struct bcm2835_i2c_slave {
-	struct i2c_adapter adapter;
 
 	spinlock_t lock;
 	void __iomem *base;
 	int irq;
 	struct clk *clk;
-	u32 cdiv;
-	u32 clk_tout;
+	struct device *dev;
 
 	struct completion done;
 
@@ -55,6 +53,7 @@ struct bcm2835_i2c_slave {
 
 static inline void debug_bsc_slave_register(struct bcm2835_i2c_slave *bi)
 {
+	u32 reg;
 	reg = READ(bi, BSC_SLV);
 	printk( KERN_INFO "Slave Address: 0x%x\n", reg);
 
@@ -66,7 +65,7 @@ static inline void debug_bsc_slave_register(struct bcm2835_i2c_slave *bi)
 	printk( KERN_INFO "Transmit mode %s\n", (reg & BSC_CR_TXE) ? "enabled" : "disabled");
 	printk( KERN_INFO "I2C Mode %s\n", (reg & BSC_CR_I2C) ? "enabled" : "disabled");
 	printk( KERN_INFO "SPI Mode %s\n", (reg & BSC_CR_SPI) ? "enabled" : "disabled");
-	printk( KERN_INFO "Device Enabled\n", (reg & BSC_CR_EN) ? "Enabled" : "Disabled");
+	printk( KERN_INFO "Device %s\n", (reg & BSC_CR_EN) ? "Enabled" : "Disabled");
 	
 	reg = READ(bi, BSC_FR);
 	printk( KERN_INFO "FR: 0x%x\n", reg);
@@ -124,111 +123,63 @@ static inline void bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave  *bi)
 
 static inline int bcm2835_bsc_slave_setup(struct bcm2835_i2c_slave *bi)
 {
-	int reg;
 	u32 c = BSC_CR_I2C | BSC_CR_RXE | BSC_CR_TXE | BSC_CR_EN;
 	
 	WRITE(bi, BSC_IFLS, ((BSC_IFLS_ONE_EIGHTS << 3) & BSC_IFLS_RXIFLSEL) | (BSC_IFLS_ONE_EIGHTS & BSC_IFLS_TXIFLSEL));
 	WRITE(bi, BSC_IMSC, BSC_IMSC_RXIM | BSC_IMSC_TXIM);
 	WRITE(bi, BSC_RSR, 0);
-	WRITE(bi, BSC_SLV, SLV_ADDRESS);
+	WRITE(bi, BSC_SLV, slave_add);
 	WRITE(bi, BSC_CR, c);	
 	
 	#ifdef DEBUG
 	debug_bsc_slave_register(bi);
 	#endif
+	return 0;
 }
 
 static irqreturn_t bcm2835_i2c_slave_interrupt(int irq, void *dev_id)
 {
-	u32 reg, stat_reg;
+	u32 reg;
 	struct bcm2835_i2c_slave *bi = dev_id;
-   	int tx_value_count;
 
 	spin_lock(&bi->lock);
-   	stat_reg = READ(bi, BSC_MIS);      //interrupt status reg
+   	reg = READ(bi, BSC_MIS);      //interrupt status reg
                                                      // clear error register
  	WRITE(bi, BSC_RSR, 0);
 	printk( KERN_INFO "irq mis en place\n");
-   	if(stat_reg & BSC_MIS_RXMIS) {
+   	if(reg & BSC_MIS_RXMIS) {
 		printk( KERN_INFO "interruption detectee sur RX\n");
-		bcm2835_bsc_slave_fifo_drain(struct bcm2835_i2c_slave *bi);    		
+		bcm2835_bsc_slave_fifo_drain(bi);    		
    	}
 
-	if(stat_reg & BSC_MIS_TXMIS){
-
+	if(reg & BSC_MIS_TXMIS){
 		printk( KERN_INFO "interruption detectee sur TX\n");
- 		bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave *bi); 
+		if(!bi->nmsgs || !bi->msg)
+		{
+			reg = READ(bi, BSC_IMSC);
+			reg &= ~(BSC_IMSC_TXIM);
+			WRITE(bi, BSC_IMSC, reg);
+		}
+		else
+ 			bcm2835_bsc_slave_fifo_fill(bi); 
   	}
-	spin_unlock(&i2c_slave->lock);
+	spin_unlock(&bi->lock);
 
    return IRQ_HANDLED;
 }
-
-static int bcm2835_i2c_slave_master_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
-{
-	struct bcm2835_i2c_slave *bi = adap->algo_data;
-	unsigned long flags;
-	int ret;
-
-	spin_lock_irqsave(&bi->lock, flags);
-
-	reinit_completion(&bi->done);
-	bi->msg = msgs;
-	bi->pos = 0;
-	bi->nmsgs = num;
-	bi->error = false;
-	ret = 5;
-	//ret = bcm2835_bsc_setup(bi);
-
-	spin_unlock_irqrestore(&bi->lock, flags);
-
-	/* check the result of the setup */
-	if (ret < 0)
-	{
-		dev_err(&adap->dev, "transfer setup timed out\n");
-		goto error_timeout;
-	}
-
-	ret = wait_for_completion_timeout(&bi->done, adap->timeout);
-	if (ret == 0) {
-		dev_err(&adap->dev, "transfer timed out\n");
-		goto error_timeout;
-	}
-
-	ret = bi->error ? -EIO : num;
-	return ret;
-
-error_timeout:
-	spin_lock_irqsave(&bi->lock, flags);
-	bi->msg = 0; /* to inform the interrupt handler that there's nothing else to be done */
-	bi->nmsgs = 0;
-	spin_unlock_irqrestore(&bi->lock, flags);
-	return -ETIMEDOUT;
-}
-
-static u32 bcm2835_i2c_slave_functionality(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static struct i2c_algorithm bcm2835_i2c_slave_algorithm = {
-	.master_xfer = bcm2835_i2c_slave_master_xfer,
-	.functionality = bcm2835_i2c_slave_functionality,
-};
-
 static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 {
 	struct resource *regs;
 	int irq, err = -ENOMEM;
 	struct clk *clk;
 	struct bcm2835_i2c_slave *bi;
-	struct i2c_adapter *adap;
 	unsigned long bus_hz;
 	u32 cdiv, clk_tout;
 	u32 baud;
 	
 	baud = CONFIG_I2C_BCM2708_BAUDRATE;
 
+	printk(KERN_INFO "%s\n", pdev->name);
 	if (pdev->dev.of_node) {
 		u32 bus_clk_rate;
 		pdev->id = of_alias_get_id(pdev->dev.of_node, "i2cslv");
@@ -259,7 +210,6 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	clk = clk_get(&pdev->dev, NULL);
 	if (IS_ERR(clk)) {
 		dev_err(&pdev->dev, "could not find clk: %ld\n", PTR_ERR(clk));
-		//return PTR_ERR(clk);
 	}
 	err = clk_prepare_enable(clk);
 	if (err) {
@@ -270,15 +220,6 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	if (!bi)
 		goto out_clk_disable;
 	platform_set_drvdata(pdev, bi);
-	adap = &bi->adapter;
-	adap->class = I2C_CLASS_HWMON | I2C_CLASS_DDC;
-	adap->algo = &bcm2835_i2c_slave_algorithm;
-	adap->algo_data = bi;
-	adap->dev.parent = &pdev->dev;
-	adap->nr = pdev->id;
-	strlcpy(adap->name, dev_name(&pdev->dev), sizeof(adap->name));
-	adap->dev.of_node = pdev->dev.of_node;
-	adap->class = I2C_CLASS_HWMON;
 
 	spin_lock_init(&bi->lock);
 	init_completion(&bi->done);
@@ -301,12 +242,7 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 
 	bcm2835_bsc_slave_reset(bi);
 	bcm2835_bsc_slave_setup(bi);
-	err = i2c_add_numbered_adapter(adap);
-	if (err < 0) {
-		dev_err(&pdev->dev, "could not add I2C adapter: %d\n", err);
-		goto out_free_irq;
-	}
-
+	
 	bus_hz = clk_get_rate(bi->clk);
 	cdiv = bus_hz / baud;
 	if (cdiv > 0xffff) {
@@ -317,9 +253,6 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	clk_tout = 35/1000*baud; //35ms timeout as per SMBus specs.
 	if (clk_tout > 0xffff)
 		clk_tout = 0xffff;
-	
-	bi->cdiv = cdiv;
-	bi->clk_tout = clk_tout;
 
 	dev_info(&pdev->dev, "BSC%d Controller at 0x%08lx (irq %d) (baudrate %d)\n",
 		pdev->id, (unsigned long)regs->start, irq, baud);
@@ -342,10 +275,8 @@ out_clk_put:
 static int bcm2835_i2c_slave_remove(struct platform_device *pdev)
 {
 	struct bcm2835_i2c_slave *bi = platform_get_drvdata(pdev);
-
 	platform_set_drvdata(pdev, NULL);
-
-	i2c_del_adapter(&bi->adapter);
+	
 	free_irq(bi->irq, bi);
 	iounmap(bi->base);
 	clk_disable_unprepare(bi->clk);
