@@ -1,9 +1,12 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/spinlock.h>
 #include <linux/clk.h>
 #include <linux/err.h>
+#include <linux/cdev.h>
 #include <linux/of.h>
+#include <linux/fs.h>
 #include <linux/platform_device.h>
 #include <linux/io.h>
 #include <linux/slab.h>
@@ -12,14 +15,16 @@
 #include <linux/sched.h>
 #include <linux/wait.h>
 #include <linux/circ_buf.h>
+#include <asm/uaccess.h>
 #include "bcm2835_slave_mod.h"
 
 #define I2C_WAIT_LOOP_COUNT	200
-#define SLV_ADDRESS		0x42
-#define DRV_NAME		"bcm2835_i2c_slave"
-
-#define READ( __bcm2835_i2c_slave__, __reg__ ) readl( __bcm2835_i2c_slave__->base + __reg__)
-#define WRITE( __bcm2835_i2c_slave__, __reg__ , __val__) writel( __val__, __bcm2835_i2c_slave__->base + __reg__)
+#define SLV_ADDRESS			0x42
+#define DRV_NAME				"bcm2835_i2c_slave"
+#define DEVICE_NAME			"i2c_slave"
+#define BUFFER_SIZE				200
+#define READ_SLAVE( __bcm2835_i2c_slave__, __reg__ ) readl( __bcm2835_i2c_slave__->base + __reg__)
+#define WRITE_SLAVE( __bcm2835_i2c_slave__, __reg__ , __val__) writel( __val__, __bcm2835_i2c_slave__->base + __reg__)
 
 #define DEBUG 1
 
@@ -35,29 +40,32 @@ static bool combined = false;
 module_param(combined, bool, 0644);
 MODULE_PARM_DESC(combined, "Use combined transactions");
 
+static struct class *i2c_slave_class;
+
 struct bcm2835_i2c_slave {
 
 	spinlock_t lock;
 	void __iomem *base;
 	int irq;
 	struct clk *clk;
+	struct cdev cdev;
 	struct device *dev;
-
+	int major;
+	
 	struct completion done;
-
-	struct i2c_msg *msg;	
-	int pos;
-	int nmsgs;
+	
+	struct circ_buf rx_buff;
+	struct circ_buf tx_buff;
 	bool error;
 };
 
 static inline void debug_bsc_slave_register(struct bcm2835_i2c_slave *bi)
 {
 	u32 reg;
-	reg = READ(bi, BSC_SLV);
+	reg = READ_SLAVE(bi, BSC_SLV);
 	printk( KERN_INFO "Slave Address: 0x%x\n", reg);
 
-	reg = READ(bi, BSC_CR);
+	reg = READ_SLAVE(bi, BSC_CR);
 	printk( KERN_INFO "Control Register value: 0x%x\n", reg);
 	
 	printk( KERN_INFO "Break %s (I2C TX functions %s)\n", (reg & BSC_CR_BRK) ? "Enabled" : "Disabled", (reg & BSC_CR_BRK) ? "disabled" : "enabled");
@@ -67,7 +75,7 @@ static inline void debug_bsc_slave_register(struct bcm2835_i2c_slave *bi)
 	printk( KERN_INFO "SPI Mode %s\n", (reg & BSC_CR_SPI) ? "enabled" : "disabled");
 	printk( KERN_INFO "Device %s\n", (reg & BSC_CR_EN) ? "Enabled" : "Disabled");
 	
-	reg = READ(bi, BSC_FR);
+	reg = READ_SLAVE(bi, BSC_FR);
 	printk( KERN_INFO "FR: 0x%x\n", reg);
 
 	printk( KERN_INFO "RX FIFO Level: 0x%x\n", (reg & 0xf800) / 2048);
@@ -84,52 +92,129 @@ static inline void debug_bsc_slave_register(struct bcm2835_i2c_slave *bi)
 		
 	printk( KERN_INFO "Transmit %s.\n", (reg & BSC_CR_EN) ? "operation in progress" : "inactive");
 
-	reg = READ(bi, BSC_IFLS);
+	reg = READ_SLAVE(bi, BSC_IFLS);
 	printk( KERN_INFO "IFLS: 0x%x\n", reg);
 
 	printk( KERN_INFO "RX FIFO Interrupt trigger: 0x%x\n", (reg & 0x0038) / 8);
 	printk( KERN_INFO "TX FIFO interrupt trigger: 0x%x\n", (reg & 0x7));
 
-	reg = READ(bi, BSC_IMSC);
+	reg = READ_SLAVE(bi, BSC_IMSC);
 	printk( KERN_INFO "IMSC: 0x%x\n", reg);
 
-	reg = READ(bi, BSC_RIS);
+	reg = READ_SLAVE(bi, BSC_RIS);
 	printk( KERN_INFO "RIS: 0x%x\n", reg);
 
-	reg = READ(bi, BSC_MIS);
+	reg = READ_SLAVE(bi, BSC_MIS);
 	printk( KERN_INFO "MIS: 0x%x\n", reg);
 
-	reg = READ(bi, BSC_ICR);
+	reg = READ_SLAVE(bi, BSC_ICR);
 	printk( KERN_INFO "ICR: 0x%x\n", reg);
 }
 
 static inline void bcm2835_bsc_slave_reset(struct bcm2835_i2c_slave *bi)
 {
-	WRITE(bi, BSC_CR, 0);
-	WRITE(bi, BSC_SLV, 0);
+	WRITE_SLAVE(bi, BSC_CR, 0);
+	WRITE_SLAVE(bi, BSC_SLV, 0);
 }
 
 static inline void bcm2835_bsc_slave_fifo_drain(struct bcm2835_i2c_slave *bi)
 {
-	while (!(READ(bi, BSC_FR) & BSC_FR_RXFE) && (bi->pos < bi->msg->len))
-		bi->msg->buf[bi->pos++] = READ(bi, BSC_DR) & BSC_DR_DATA_MASK;
+	int head = bi->rx_buff.head;
+	int tail = ACCESS_ONCE(bi->rx_buff.tail);
+	while (!(READ_SLAVE(bi, BSC_FR) & BSC_FR_RXFE) && CIRC_SPACE(head, tail, BUFFER_SIZE))
+	{
+		bi->rx_buff.buf[head] = READ_SLAVE(bi, BSC_DR) & BSC_DR_DATA_MASK;
+		smp_store_release(bi->rx_buff.head, (head + 1) & (BUFFER_SIZE - 1));
+	}
+	
 }
 
 static inline void bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave  *bi)
 {
-	while (!(READ(bi, BSC_FR) & BSC_FR_TXFE) && (bi->pos < bi->msg->len))
-		WRITE(bi, BSC_DR, bi->msg->buf[bi->pos++]);
+	int head = smp_load_acqquire(bi->tx_buff.head);
+	int tail = bi->tx_buff.tail;
+	while (!(READ_SLAVE(bi, BSC_FR) & BSC_FR_TXFE) && (CIRC_CNT(head, tail, BUFFER_SIZE) >= 1))
+	{
+		WRITE_SLAVE(bi, BSC_DR, bi->tx_buff.buf[head]);
+		smp_store_release(bi->tx_buff.tail, (tail + 1) & (BUFFER_SIZE - 1));	
+	}
 }
+
+static ssize_t i2c_slave_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
+{
+	struct bcm2835_i2c_slave  *bi = file->private_data;
+	char *tmp;
+	int head = smp_load_acquire(bi->rx_buff.head);
+	int tail = bi->rx_buff.tail;
+	int i;
+	if(!(CIRC_CNT(head, tail, BUFFER_SIZE) >= 1 && CIRC_CNT(head, tail, BUFFER_SIZE) >= count))
+	{
+		count = CIRC_CNT(head, tail, BUFFER_SIZE);
+	}
+	tmp = kmalloc(count*sizeof(char), GFP_KERNEL);
+	for(i = 0; i < count; i++)
+	{
+		tmp[i] = bi->rx_buff.buf[tail];
+		smp_store_release(bi->rx_buff.tail, (tail + 1) & (BUFFER_SIZE-1));
+		tail = bi->rx_buff.tail;
+	}
+	if(copy_to_user(buf, tmp, count))
+		kfree(tmp);
+		return -EFAULT;
+	kfree(tmp);
+	return count;
+}
+static ssize_t i2c_slave_write(struct file *file, char __user *buf, size_t count, loff_t *offset)
+{
+	struct bcm2835_i2c_slave  *bi = file->private_data;
+	char *tmp;
+	int reg;
+	int head = bi->tx_buff.head;
+	int tail = ACCESS_ONCE(bi->tx_buff.tail);
+	int i;
+	if(!(CIRC_SPACE(head, tail, BUFFER_SIZE) && CIRC_SPACE(head, tail, BUFFER_SIZE) >= count))
+	{
+		count = CIRC_SPACE(head, tail, BUFFER_SIZE);
+	}
+	tmp = kmalloc(count*sizeof(char), GFP_KERNEL);
+	if(copy_from_user(tmp, buf, count))
+		return -EFAULT;
+	for(i = 0; i < count; i++)
+	{
+		tmp[i] = bi->tx_buff.buf[head];
+		smp_store_release(bi->tx_buff.head, (head + 1) & (BUFFER_SIZE-1));
+		head = bi->tx_buff.head;
+	}
+	reg = READ(bi, BSC_IMSC);
+	reg |= BSC_IMSC_TXIM;
+	WRITE(bi, BSC_IMSC, reg);
+	kfree(tmp);
+	return count;
+}
+static int i2c_slave_open(struct inode *inode, struct file *file) 
+{
+	struct bcm2835_i2c_slave  *bi;
+	bi = container_of(inode->i_cdev, struct bcm2835_i2c_slave, cdev);
+	file->private_data = bi;
+	return 0;
+}
+int i2c_slave_release(struct inode *inode, struct file *file)
+{
+	struct bcm2835_i2c_slave *bi;
+	bi = file->private_data;
+	return 0;
+}
+
 
 static inline int bcm2835_bsc_slave_setup(struct bcm2835_i2c_slave *bi)
 {
 	u32 c = BSC_CR_I2C | BSC_CR_RXE | BSC_CR_TXE | BSC_CR_EN;
 	
-	WRITE(bi, BSC_IFLS, ((BSC_IFLS_ONE_EIGHTS << 3) & BSC_IFLS_RXIFLSEL) | (BSC_IFLS_ONE_EIGHTS & BSC_IFLS_TXIFLSEL));
-	WRITE(bi, BSC_IMSC, BSC_IMSC_RXIM | BSC_IMSC_TXIM);
-	WRITE(bi, BSC_RSR, 0);
-	WRITE(bi, BSC_SLV, slave_add);
-	WRITE(bi, BSC_CR, c);	
+	WRITE_SLAVE(bi, BSC_IFLS, ((BSC_IFLS_ONE_EIGHTS << 3) & BSC_IFLS_RXIFLSEL) | (BSC_IFLS_ONE_EIGHTS & BSC_IFLS_TXIFLSEL));
+	WRITE_SLAVE(bi, BSC_IMSC, BSC_IMSC_RXIM | BSC_IMSC_TXIM);
+	WRITE_SLAVE(bi, BSC_RSR, 0);
+	WRITE_SLAVE(bi, BSC_SLV, slave_add);
+	WRITE_SLAVE(bi, BSC_CR, c);	
 	
 	#ifdef DEBUG
 	debug_bsc_slave_register(bi);
@@ -143,9 +228,9 @@ static irqreturn_t bcm2835_i2c_slave_interrupt(int irq, void *dev_id)
 	struct bcm2835_i2c_slave *bi = dev_id;
 
 	spin_lock(&bi->lock);
-   	reg = READ(bi, BSC_MIS);      //interrupt status reg
+   	reg = READ_SLAVE(bi, BSC_MIS);      //interrupt status reg
                                                      // clear error register
- 	WRITE(bi, BSC_RSR, 0);
+ 	WRITE_SLAVE(bi, BSC_RSR, 0);
 	printk( KERN_INFO "irq mis en place\n");
    	if(reg & BSC_MIS_RXMIS) {
 		printk( KERN_INFO "interruption detectee sur RX\n");
@@ -154,11 +239,11 @@ static irqreturn_t bcm2835_i2c_slave_interrupt(int irq, void *dev_id)
 
 	if(reg & BSC_MIS_TXMIS){
 		printk( KERN_INFO "interruption detectee sur TX\n");
-		if(!bi->nmsgs || !bi->msg)
+		if(bi->tx_buff.head == bi->tx_buff.tail)
 		{
-			reg = READ(bi, BSC_IMSC);
+			reg = READ_SLAVE(bi, BSC_IMSC);
 			reg &= ~(BSC_IMSC_TXIM);
-			WRITE(bi, BSC_IMSC, reg);
+			WRITE_SLAVE(bi, BSC_IMSC, reg);
 		}
 		else
  			bcm2835_bsc_slave_fifo_fill(bi); 
@@ -176,6 +261,7 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	unsigned long bus_hz;
 	u32 cdiv, clk_tout;
 	u32 baud;
+	dev_t dev_number;
 	
 	baud = CONFIG_I2C_BCM2708_BAUDRATE;
 
@@ -220,7 +306,29 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	if (!bi)
 		goto out_clk_disable;
 	platform_set_drvdata(pdev, bi);
-
+	//////////////////////////////////////////////////////////////////////////////////////
+	err = alloc_chrdev_region(&dev_number, 0, 1, DEVICE_NAME);
+ 	bi->major = MAJOR(dev_number);
+  	if( err < 0){
+    		dev_err(&pdev->dev, "alloc_chrdev_region failed for i2cslave : %d\n", err);
+    		return -ENODEV;
+ 	 }
+  	i2c_slave_class = class_create(THIS_MODULE, DEVICE_NAME);
+  	if(IS_ERR(i2c_slave_class)) {
+     		err = PTR_ERR(i2c_slave_class);
+     		goto class_fail;
+  	}
+  	cdev_init(&bi->cdev, &i2c_slave_fops);
+  	err = cdev_add(&bi->cdev, dev_number,1);
+  	if(err){
+     		goto class_fail;
+  	}
+	bi->dev = device_create(i2c_slave_class, &pdev->dev, dev_number, NULL, DEVICE_NAME, pdev->id);
+	if(IS_ERR(bi->dev)){
+		printk(KERN_NOTICE "C'ant create device in sysfs!\n");
+	goto dev_create_fail;
+	}
+	////////////////////////////////////////////////////////////////////////////////////
 	spin_lock_init(&bi->lock);
 	init_completion(&bi->done);
 
@@ -239,6 +347,15 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "could not request IRQ: %d\n", err);
 		goto out_iounmap;
 	}
+	
+	bi->rx_buff.buf = kmalloc(BUFFER_SIZE*sizeof(char), GFP_KERNEL);
+	if(bi->rx_buff.buf == NULL)
+		goto out_rx_alloc_mem;
+	bi->tx_buff.buf = kmalloc(BUFFER_SIZE*sizeof(char), GFP_KERNEL);
+	if(bi->tx_buff.buf == NULL)
+		goto out_tx_alloc_mem;
+	bi->rx_buff.head = bi->rx_buff.tail = 0;
+	bi->tx_buff.head = bi->tx_buff.tail = 0;
 
 	bcm2835_bsc_slave_reset(bi);
 	bcm2835_bsc_slave_setup(bi);
@@ -258,13 +375,21 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 		pdev->id, (unsigned long)regs->start, irq, baud);
 	printk(KERN_INFO "it's ok\n");
 	return 0;
-
+out_tx_alloc_mem:
+	dev_err(&pdev->dev, "could not allocate TX buffer memory\n");
+	kfree(bi->rx_buff.buf);
+out_rx_alloc_mem:
+	dev_err(&pdev->dev, "could not allocate RX buffer memory\n");
 out_free_irq:
 	free_irq(bi->irq, bi);
 out_iounmap:
 	iounmap(bi->base);
 out_free_bi:
 	kfree(bi);
+dev_create_fail:
+	cdev_del(&bi->cdev);
+class_fail:
+	unregister_chrdev_region(dev_number, 1);
 out_clk_disable:
 	clk_disable_unprepare(clk);
 out_clk_put:
@@ -277,6 +402,16 @@ static int bcm2835_i2c_slave_remove(struct platform_device *pdev)
 	struct bcm2835_i2c_slave *bi = platform_get_drvdata(pdev);
 	platform_set_drvdata(pdev, NULL);
 	
+	printk(KERN_NOTICE "i2c-slave module removed!\n");
+	kfree(bi->rx_buff.buf);
+	kfree(bi->tx_buff.buf);
+	device_destroy(i2c_slave_class, MKDEV(bi->major,0));
+	class_destroy(i2c_slave_class);
+	
+
+	unregister_chrdev_region(MKDEV(bi->major, 0), 1);
+	cdev_del(&bi->cdev);
+
 	free_irq(bi->irq, bi);
 	iounmap(bi->base);
 	clk_disable_unprepare(bi->clk);
@@ -286,11 +421,21 @@ static int bcm2835_i2c_slave_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct file_operations i2c_slave_fops = {
+	.owner = THIS_MODULE,
+	.open = i2c_slave_open,
+	.release = i2c_slave_release,
+	.read = i2c_slave_read,
+	.write = i2c_slave write,
+	.llseek = no_llseek,
+};
+
 static const struct of_device_id bcm2835_i2c_slave_of_match[] = {
         { .compatible = "brcm,bcm2835-i2c-slave" },
         {},
 };
 MODULE_DEVICE_TABLE(of, bcm2835_i2c_slave_of_match);
+
 
 static struct platform_driver bcm2835_i2c_slave_driver = {
 	.driver		= {
