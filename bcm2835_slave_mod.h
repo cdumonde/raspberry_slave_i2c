@@ -1,3 +1,6 @@
+/*IOCTL define*/
+#define I2C_READ_AVAILABLE	0x00000001
+
 /*Address register base*/
 #define I2C_SPI_FIFOS_BASE	0x3F204000	// BSC/SPI FIFOS registers base addresses
 
