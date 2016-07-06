@@ -53,9 +53,7 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	while (1) {
-		if(ioctl(fd, 1))
-		{	
+	while (1) {	
 			length = read(fd, tx_buffer, TX_BUF_SIZE);
 			for(i = 0; i < length; i++)
 			{
@@ -72,7 +70,6 @@ int main(int argc, char **argv)
 				}
 			}
 			write(fd, tx_buffer, length);
-		}
 	}
 
 	close(fd);

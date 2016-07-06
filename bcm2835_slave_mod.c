@@ -50,8 +50,8 @@ struct bcm2835_i2c_slave {
 	
 	struct circ_buf rx_buff;
 	struct circ_buf tx_buff;
-	struct wait_queue_head_t in_queue;
-	struct wait_queue_head_t out_queue;
+	wait_queue_head_t in_queue;
+	wait_queue_head_t out_queue;
 };
 
 static inline void debug_bsc_slave_register(struct bcm2835_i2c_slave *bi)
@@ -133,7 +133,9 @@ static inline void bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave  *bi)
 	while (!(READL(bi, BSC_FR) & BSC_FR_TXFF) && (CIRC_CNT(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE) >= 1)) {
 		WRITEL(bi, BSC_DR, bi->tx_buff.buf[bi->tx_buff.tail]);
 		smp_rmb();
+		printk(KERN_INFO "data stored : %c\n", bi->tx_buff.buf[bi->tx_buff.tail]);
 		INCREMENT_BUFF_CURSOR(bi->tx_buff.tail, 1);
+		
 	}
 	spin_unlock(&bi->tx_lock);
 }
@@ -141,11 +143,11 @@ static inline void bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave  *bi)
 static ssize_t i2c_slave_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
 	struct bcm2835_i2c_slave  *bi = file->private_data;
-	int res = -EFAULT, buffer_empty = TRUE;
+	int res = -EFAULT;
 	int length;
 	size_t effective_count;
 	
-	wait_event_interruptible(bi->out_queue, bi->rx_buff.tail == bi->rx_buff.head);
+	wait_event_interruptible(bi->out_queue, CIRC_CNT(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE));
 	spin_lock(&bi->rx_lock);
 	length = CIRC_CNT_TO_END(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE);
 	effective_count = CIRC_CNT(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE);
@@ -156,7 +158,7 @@ static ssize_t i2c_slave_read(struct file *file, char __user *buf, size_t count,
 	if(copy_to_user(buf, &(bi->rx_buff.buf[bi->rx_buff.tail]), length)) {
 		goto unlock_rx_buffer;
 	}
-	res = length
+	res = length;
 	if (effective_count > length) {
 		if(copy_to_user(buf + length, &(bi->rx_buff.buf[0]), effective_count - length) == 0) {
 			res += effective_count - length;
@@ -176,7 +178,7 @@ static ssize_t i2c_slave_write(struct file *file, const char __user *buf, size_t
 	int length;
 	size_t effective_count;
 	
-	wait_event_interruptible(bi->in_queue, bi->tx_buff.tail != bi->tx_buff.head);
+	wait_event_interruptible(bi->in_queue, CIRC_SPACE(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE));
 	spin_lock(&bi->tx_lock);
 	length = CIRC_SPACE_TO_END(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE);
 	effective_count = CIRC_SPACE(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE);
@@ -184,15 +186,16 @@ static ssize_t i2c_slave_write(struct file *file, const char __user *buf, size_t
 		effective_count = count;
 	}
 	length = min(length , effective_count);
-	if(copy_from_user(&(bi->rx_buff.buf[bi->rx_buff.head]), buf, length)) {
+	if(copy_from_user(&bi->tx_buff.buf[bi->tx_buff.head], buf, length)) {
 		goto unlock_tx_buffer;
 	}
 	res = length;
 	if (effective_count > length) {
-		if(copy_from_user(&(bi->tx_buff.buf[0]), buf + length, effective_count - length) == 0) {
+		if(copy_from_user(&bi->tx_buff.buf[0], buf + length, effective_count - length) == 0) {
 			res += effective_count - length;
 		}
 	}
+	
 	INCREMENT_BUFF_CURSOR(bi->tx_buff.head, res);
 	reg = READL(bi, BSC_IMSC);
 	reg |= BSC_IMSC_TXIM;
@@ -243,9 +246,11 @@ static irqreturn_t bcm2835_i2c_slave_interrupt(int irq, void *dev_id)
  	WRITEL(bi, BSC_RSR, 0);
 
    	if(reg & BSC_MIS_RXMIS) {
+		printk(KERN_INFO "RX interrupt %d\n", reg & BSC_MIS_TXMIS);
 		bcm2835_bsc_slave_fifo_drain(bi);
 		wake_up_interruptible(&bi->out_queue);
-	} else if(reg & BSC_MIS_TXMIS) {
+	} if(reg & BSC_MIS_TXMIS) {
+		printk(KERN_INFO "TX interrupt\n");
 		if(bi->tx_buff.head == bi->tx_buff.tail) {
 			reg = READL(bi, BSC_IMSC);
 			reg &= ~(BSC_IMSC_TXIM);
@@ -308,7 +313,7 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	}
 	bi = kzalloc(sizeof(*bi), GFP_KERNEL);
 	if (!bi)
-		goto out_clk_disable;
+		goto out_free_bi;
 	platform_set_drvdata(pdev, bi);
 
 	err = alloc_chrdev_region(&dev_number, 0, 1, DEVICE_NAME);
@@ -320,17 +325,17 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
   	i2c_slave_class = class_create(THIS_MODULE, DEVICE_NAME);
   	if(IS_ERR(i2c_slave_class)) {
      		err = PTR_ERR(i2c_slave_class);
-     		goto class_fail;
+     		goto out_delete_cdev;
   	}
   	cdev_init(&bi->cdev, &i2c_slave_fops);
-  	err = cdev_add(&bi->cdev, dev_number,1);
+  	err = cdev_add(&bi->cdev, dev_number, 1);
   	if(err){
-     		goto class_fail;
+     		goto out_delete_cdev;
   	}
 	bi->dev = device_create(i2c_slave_class, &pdev->dev, dev_number, NULL, DEVICE_NAME, pdev->id);
 	if(IS_ERR(bi->dev)) {
 		printk(KERN_NOTICE "could not create device in sysfs!\n");
-		goto dev_create_fail;
+		goto out_unalloc_region;
 	}
 	spin_lock_init(&bi->lock);
 	spin_lock_init(&bi->rx_lock);
@@ -340,7 +345,7 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	bi->base = ioremap(regs->start, resource_size(regs));
 	if (!bi->base) {
 		dev_err(&pdev->dev, "could not remap memory\n");
-		goto out_free_bi;
+		goto out_iounmap;
 	}
 
 	bi->irq = irq;
@@ -364,7 +369,6 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	init_waitqueue_head(&bi->in_queue);
 	init_waitqueue_head(&bi->out_queue);
 
-
 	bcm2835_bsc_slave_reset(bi);
 	bcm2835_bsc_slave_setup(bi);
 
@@ -380,12 +384,12 @@ out_rx_alloc_mem:
 	free_irq(bi->irq, bi);
 out_iounmap:
 	iounmap(bi->base);
+out_delete_cdev:
+	cdev_del(&bi->cdev);
+out_unalloc_region:
+	unregister_chrdev_region(dev_number, 1);
 out_free_bi:
 	kfree(bi);
-dev_create_fail:
-	cdev_del(&bi->cdev);
-class_fail:
-	unregister_chrdev_region(dev_number, 1);
 	return err;
 }
 
