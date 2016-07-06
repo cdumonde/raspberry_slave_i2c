@@ -19,10 +19,10 @@
 #include "bcm2835_slave_mod.h"
 
 #define I2C_WAIT_LOOP_COUNT	200
-#define SLV_ADDRESS			0x42
-#define DRV_NAME				"bcm2835_i2c_slave"
-#define DEVICE_NAME			"i2c_slave"
-#define BUFFER_SIZE				PAGE_SIZE
+#define SLV_ADDRESS		0x42
+#define DRV_NAME		"bcm2835_i2c_slave"
+#define DEVICE_NAME		"i2c_slave"
+#define BUFFER_SIZE		PAGE_SIZE
 #define READL( __bcm2835_i2c_slave__, __reg__ ) readl( __bcm2835_i2c_slave__->base + __reg__)
 #define WRITEL( __bcm2835_i2c_slave__, __reg__ , __val__) writel( __val__, __bcm2835_i2c_slave__->base + __reg__)
 
@@ -43,7 +43,6 @@ struct bcm2835_i2c_slave {
 	spinlock_t lock;
 	void __iomem *base;
 	int irq;
-	struct clk *clk;
 	struct cdev cdev;
 	struct device *dev;
 	int major;
@@ -116,25 +115,21 @@ static inline void bcm2835_bsc_slave_reset(struct bcm2835_i2c_slave *bi)
 
 static inline void bcm2835_bsc_slave_fifo_drain(struct bcm2835_i2c_slave *bi)
 {
-	char tmp;
-	while (!(READL(bi, BSC_FR) & BSC_FR_RXFE))
-	{
-		if(CIRC_SPACE(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE))
-		{
+	while (!(READL(bi, BSC_FR) & BSC_FR_RXFE)) {
+		if(CIRC_SPACE(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE)) {
 			bi->rx_buff.buf[bi->rx_buff.head] = READL(bi, BSC_DR) & BSC_DR_DATA_MASK;
 			smp_wmb();
 			bi->rx_buff.head = (bi->rx_buff.head + 1) & (BUFFER_SIZE - 1);
+		} else {
+			(void)READL(bi, BSC_DR);
 		}
-		else
-			tmp = READL(bi, BSC_DR);
 	}
 	
 }
 
 static inline void bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave  *bi)
 {
-	while (!(READL(bi, BSC_FR) & BSC_FR_TXFF) && (CIRC_CNT(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE) >= 1))
-	{
+	while (!(READL(bi, BSC_FR) & BSC_FR_TXFF) && (CIRC_CNT(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE) >= 1)) {
 		WRITEL(bi, BSC_DR, bi->tx_buff.buf[bi->tx_buff.tail]);
 		smp_rmb();
 		bi->tx_buff.tail = (bi->tx_buff.tail + 1) & (BUFFER_SIZE -1);
@@ -144,61 +139,61 @@ static inline void bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave  *bi)
 static ssize_t i2c_slave_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
 	struct bcm2835_i2c_slave  *bi = file->private_data;
-	char *tmp;
-	int i;
+	int l;
 	size_t effective_count = count;
 	spin_lock(&bi->lock);
-	if(!(CIRC_CNT(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE) >= 1 && CIRC_CNT(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE) >= count))
-	{
+	if(CIRC_CNT(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE) < count) {
 		effective_count = CIRC_CNT(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE);
+	}	
+	l = min(CIRC_CNT_TO_END(bi->rx_buff.head, bi->rx_buff.tail, BUFFER_SIZE), effective_count)
+	if(copy_to_user(buf, &(bi->rx_buff.buf[bi->rx_buff.tail]), l)) {
+		goto cpy_to_user;
 	}
-	tmp = kmalloc(BUFFER_SIZE*sizeof(char), GFP_KERNEL);
-	for(i = 0; i < effective_count; i++)
-	{
-		tmp[i] = bi->rx_buff.buf[bi->rx_buff.tail];
-		smp_rmb();
-		bi->rx_buff.tail = (bi->rx_buff.tail + 1) & (BUFFER_SIZE - 1);	
+	bi->rx_buff.tail = (bi->rx_buff.tail + l) & (BUFFER_SIZE - 1);
+	if (effective_count > l) {
+		if(copy_to_user(buf+l, &(bi->rx_buff.buf[bi->rx_buff.tail]), effective_count - l)) {
+			goto cpy_to_user;
+		}
+		bi->rx_buff.tail = (bi->rx_buff.tail + effective_count - l) & (BUFFER_SIZE - 1);
 	}
-	if(copy_to_user(buf, tmp, effective_count))
-	{
-		kfree(tmp);
-		return -EFAULT;
-	}
-	kfree(tmp);
 	spin_unlock(&bi->lock);
 	return effective_count;
+cpy_to_user:
+	spin_unlock(&bi->lock);
+	return -EFAULT;
 }
+
 static ssize_t i2c_slave_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
 {
 	struct bcm2835_i2c_slave  *bi = file->private_data;
-	char *tmp;
-	int reg;
-	int i;
+	u32 reg;
+	int l;
 	size_t effective_count = count;
 	spin_lock(&bi->lock);
-	if(!(CIRC_SPACE(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE) && CIRC_SPACE(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE) >= count))
-	{
+	if(CIRC_SPACE(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE) < count) {
 		effective_count = CIRC_SPACE(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE);
 	}
-	tmp = kmalloc(BUFFER_SIZE*sizeof(char), GFP_KERNEL);
-	if(copy_from_user(tmp, buf, effective_count))
-	{
-		kfree(tmp);
-		return -EFAULT;
+	l = min(CIRC_SPACE_TO_END(bi->tx_buff.head, bi->tx_buff.tail, BUFFER_SIZE), effective_count)
+	if(copy_from_user(&(bi->rx_buff.buf[bi->rx_buff.head]), buf, l)) {
+		goto cpy_from_user;
 	}
-	for(i = 0; i < effective_count; i++)
-	{
-		bi->tx_buff.buf[bi->tx_buff.head] = tmp[i];
-		smp_wmb();
-		bi->tx_buff.head = (bi->tx_buff.head + 1) & (BUFFER_SIZE - 1);
+	bi->tx_buff.head = (bi->rx_buff.head + l) & (BUFFER_SIZE - 1);
+	if (effective_count > l) {
+		if(copy_from_user(&(bi->tx_buff.buf[bi->tx_buff.head]), buf+l, effective_count - l)) {
+			goto cpy_from_user;
+		}
+		bi->tx_buff.head = (bi->tx_buff.head + effective_count - l) & (BUFFER_SIZE - 1);
 	}
 	reg = READL(bi, BSC_IMSC);
 	reg |= BSC_IMSC_TXIM;
 	WRITEL(bi, BSC_IMSC, reg);
-	kfree(tmp);
 	spin_unlock(&bi->lock);
 	return effective_count;
+cpy_from_user:
+	spin_unlock(&bi-lock);
+	return -EFAULT;
 }
+
 static int i2c_slave_open(struct inode *inode, struct file *file) 
 {
 	struct bcm2835_i2c_slave  *bi;
@@ -206,13 +201,13 @@ static int i2c_slave_open(struct inode *inode, struct file *file)
 	file->private_data = bi;
 	return 0;
 }
+
 int i2c_slave_release(struct inode *inode, struct file *file)
 {
 	struct bcm2835_i2c_slave *bi;
 	bi = file->private_data;
 	return 0;
 }
-
 
 static inline int bcm2835_bsc_slave_setup(struct bcm2835_i2c_slave *bi)
 {
@@ -243,20 +238,20 @@ static irqreturn_t bcm2835_i2c_slave_interrupt(int irq, void *dev_id)
 		bcm2835_bsc_slave_fifo_drain(bi);    		
    	}
 
-	if(reg & BSC_MIS_TXMIS){
-		if(bi->tx_buff.head == bi->tx_buff.tail)
-		{
+	if(reg & BSC_MIS_TXMIS) {
+		if(bi->tx_buff.head == bi->tx_buff.tail) {
 			reg = READL(bi, BSC_IMSC);
 			reg &= ~(BSC_IMSC_TXIM);
 			WRITEL(bi, BSC_IMSC, reg);
-		}
-		else
- 			bcm2835_bsc_slave_fifo_fill(bi); 
+		} else {
+ 			bcm2835_bsc_slave_fifo_fill(bi);
+ 		} 
   	}
 	spin_unlock(&bi->lock);
 
    return IRQ_HANDLED;
 }
+
 static long i2c_slave_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct bcm2835_i2c_slave  *bi = file->private_data;
@@ -269,7 +264,6 @@ static long i2c_slave_ioctl(struct file *file, unsigned int cmd, unsigned long a
 	}
 	return 0;
 }
-
 
 static const struct file_operations i2c_slave_fops = {
 	.owner = THIS_MODULE,
@@ -317,7 +311,6 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0) {
 		dev_err(&pdev->dev, "could not get IRQ\n");
-		//return irq;
 	}
 	clk = clk_get(&pdev->dev, NULL);
 	if (IS_ERR(clk)) {
@@ -335,10 +328,10 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 
 	err = alloc_chrdev_region(&dev_number, 0, 1, DEVICE_NAME);
  	bi->major = MAJOR(dev_number);
-  	if( err < 0){
+  	if( err < 0) {
     		dev_err(&pdev->dev, "alloc_chrdev_region failed for i2cslave : %d\n", err);
     		return -ENODEV;
- 	 }
+ 	}
   	i2c_slave_class = class_create(THIS_MODULE, DEVICE_NAME);
   	if(IS_ERR(i2c_slave_class)) {
      		err = PTR_ERR(i2c_slave_class);
@@ -350,9 +343,9 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
      		goto class_fail;
   	}
 	bi->dev = device_create(i2c_slave_class, &pdev->dev, dev_number, NULL, DEVICE_NAME, pdev->id);
-	if(IS_ERR(bi->dev)){
+	if(IS_ERR(bi->dev)) {
 		printk(KERN_NOTICE "C'ant create device in sysfs!\n");
-	goto dev_create_fail;
+		goto dev_create_fail;
 	}
 
 	spin_lock_init(&bi->lock);
