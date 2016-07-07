@@ -45,6 +45,7 @@ struct bcm2835_i2c_slave {
 	struct cdev cdev;
 	struct device *dev;
 	int major;
+	unsigned int slave_address;
 	
 	struct completion done;
 	
@@ -53,58 +54,6 @@ struct bcm2835_i2c_slave {
 	wait_queue_head_t in_queue;
 	wait_queue_head_t out_queue;
 };
-
-static inline void debug_bsc_slave_register(struct bcm2835_i2c_slave *bi)
-{
-	unsigned int reg;
-	reg = READL(bi, BSC_SLV);
-	printk(KERN_INFO "Slave Address: 0x%x\n", reg);
-
-	reg = READL(bi, BSC_CR);
-	printk(KERN_INFO "Control Register value: 0x%x\n", reg);
-	
-	printk(KERN_INFO "Break %s (I2C TX functions %s)\n", (reg & BSC_CR_BRK) ? "Enabled" : "Disabled", (reg & BSC_CR_BRK) ? "disabled" : "enabled");
-	printk(KERN_INFO "Receive Mode %s (Only affects SPI?)\n", (reg & BSC_CR_RXE) ? "Enabled" : "Disabled");
-	printk(KERN_INFO "Transmit mode %s\n", (reg & BSC_CR_TXE) ? "enabled" : "disabled");
-	printk(KERN_INFO "I2C Mode %s\n", (reg & BSC_CR_I2C) ? "enabled" : "disabled");
-	printk(KERN_INFO "SPI Mode %s\n", (reg & BSC_CR_SPI) ? "enabled" : "disabled");
-	printk(KERN_INFO "Device %s\n", (reg & BSC_CR_EN) ? "Enabled" : "Disabled");
-	
-	reg = READL(bi, BSC_FR);
-	printk(KERN_INFO "FR: 0x%x\n", reg);
-
-	printk(KERN_INFO "RX FIFO Level: 0x%x\n", (reg & 0xf800) / 2048);
-	printk(KERN_INFO "TX FIFO Level: 0x%x\n", (reg & 0x7c0) / 64);
-	
-	if ((reg & BSC_FR_TXFE) != 0)
-		printk(KERN_INFO "TX Fifo Empty\n");
-	else if ((reg & BSC_FR_TXFF) != 0)
-		printk(KERN_INFO "TX Fifo full\n");
-	if ((reg & BSC_FR_RXFE) != 0)
-		printk(KERN_INFO "RX Fifo Empty\n");
-	else if ((reg & BSC_FR_RXFF) != 0)
-		printk(KERN_INFO "RX Fifo full\n");
-		
-	printk(KERN_INFO "Transmit %s.\n", (reg & BSC_CR_EN) ? "operation in progress" : "inactive");
-
-	reg = READL(bi, BSC_IFLS);
-	printk(KERN_INFO "IFLS: 0x%x\n", reg);
-
-	printk(KERN_INFO "RX FIFO Interrupt trigger: 0x%x\n", (reg & 0x0038) / 8);
-	printk(KERN_INFO "TX FIFO interrupt trigger: 0x%x\n", (reg & 0x7));
-
-	reg = READL(bi, BSC_IMSC);
-	printk(KERN_INFO "IMSC: 0x%x\n", reg);
-
-	reg = READL(bi, BSC_RIS);
-	printk(KERN_INFO "RIS: 0x%x\n", reg);
-
-	reg = READL(bi, BSC_MIS);
-	printk(KERN_INFO "MIS: 0x%x\n", reg);
-
-	reg = READL(bi, BSC_ICR);
-	printk(KERN_INFO "ICR: 0x%x\n", reg);
-}
 
 static inline void bcm2835_bsc_slave_reset(struct bcm2835_i2c_slave *bi)
 {
@@ -227,12 +176,8 @@ static inline int bcm2835_bsc_slave_setup(struct bcm2835_i2c_slave *bi)
 	WRITEL(bi, BSC_IFLS, ((BSC_IFLS_ONE_EIGHTS << 3) & BSC_IFLS_RXIFLSEL) | (BSC_IFLS_ONE_EIGHTS & BSC_IFLS_TXIFLSEL));
 	WRITEL(bi, BSC_IMSC, BSC_IMSC_RXIM | BSC_IMSC_TXIM);
 	WRITEL(bi, BSC_RSR, 0);
-	WRITEL(bi, BSC_SLV, slave_add);
-	WRITEL(bi, BSC_CR, c);	
-	
-	#ifdef DEBUG
-	debug_bsc_slave_register(bi);
-	#endif
+	WRITEL(bi, BSC_SLV, bi->slave_address);
+	WRITEL(bi, BSC_CR, c);
 	return 0;
 }
 
@@ -275,8 +220,108 @@ static long i2c_slave_ioctl(struct file *file, unsigned int cmd, unsigned long a
 			return -ENOTTY;			
 	}
 	return 0;
+}/*---------------------------------------------ATTRIBUTES---------------------------------------------------------------*/
+static ssize_t address_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct bcm2835_i2c_slave *bi = dev_get_drvdata(dev);
+	return sprintf(buf, "%x\n", bi->slave_address);
+}
+static ssize_t address_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
+{
+	unsigned long tmp;
+	int ret;
+	struct bcm2835_i2c_slave *bi = dev_get_drvdata(dev);
+	ret = kstrtol(buf, 0, &tmp);
+	if(size != 4 || ret < 0 || tmp > 0x7F) {
+		printk(KERN_INFO "Invalid address :  Address must be passed under hexadecimal form\n0x00 -- 0x7F");
+		return -EINVAL;
+	}
+	else
+	{		
+		bi->slave_address = tmp;
+		WRITEL(bi, BSC_SLV, bi->slave_address);
+	}
+	return size;
 }
 
+static DEVICE_ATTR_RW(address);
+#ifdef DEBUG
+static ssize_t debug_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	unsigned int reg;
+	ssize_t ret = 0;
+	struct bcm2835_i2c_slave *bi = dev_get_drvdata(dev);
+	spin_lock(&bi->lock);
+	reg = READL(bi, BSC_SLV);
+	sprintf(buf, "Slave Address: 0x%x\n", reg);
+
+	reg = READL(bi, BSC_CR);
+	ret += sprintf(buf, "Control Register value: 0x%x\n", reg);
+	
+	ret += sprintf(buf, "Break %s (I2C TX functions %s)\n", (reg & BSC_CR_BRK) ? "Enabled" : "Disabled", (reg & BSC_CR_BRK) ? "disabled" : "enabled");
+	ret += sprintf(buf, "Receive Mode %s (Only affects SPI?)\n", (reg & BSC_CR_RXE) ? "Enabled" : "Disabled");
+	ret += sprintf(buf, "Transmit mode %s\n", (reg & BSC_CR_TXE) ? "enabled" : "disabled");
+	ret += sprintf(buf, "I2C Mode %s\n", (reg & BSC_CR_I2C) ? "enabled" : "disabled");
+	ret += sprintf(buf, "SPI Mode %s\n", (reg & BSC_CR_SPI) ? "enabled" : "disabled");
+	ret += sprintf(buf, "Device %s\n", (reg & BSC_CR_EN) ? "Enabled" : "Disabled");
+	
+	reg = READL(bi, BSC_FR);
+	ret += sprintf(buf, "FR: 0x%x\n", reg);
+
+	ret += sprintf(buf, "RX FIFO Level: 0x%x\n", (reg & 0xf800) / 2048);
+	ret += sprintf(buf, "TX FIFO Level: 0x%x\n", (reg & 0x7c0) / 64);
+	
+	if ((reg & BSC_FR_TXFE) != 0)
+		ret += sprintf(buf, "TX Fifo Empty\n");
+	else if ((reg & BSC_FR_TXFF) != 0)
+		ret += sprintf(buf, "TX Fifo full\n");
+	if ((reg & BSC_FR_RXFE) != 0)
+		ret += sprintf(buf, "RX Fifo Empty\n");
+	else if ((reg & BSC_FR_RXFF) != 0)
+		ret += sprintf(buf, "RX Fifo full\n");
+		
+	ret += sprintf(buf, "Transmit %s.\n", (reg & BSC_CR_EN) ? "operation in progress" : "inactive");
+
+	reg = READL(bi, BSC_IFLS);
+	ret += sprintf(buf, "IFLS: 0x%x\n", reg);
+
+	ret += sprintf(buf, "RX FIFO Interrupt trigger: 0x%x\n", (reg & 0x0038) / 8);
+	ret += sprintf(buf, "TX FIFO interrupt trigger: 0x%x\n", (reg & 0x7));
+
+	reg = READL(bi, BSC_IMSC);
+	ret += sprintf(buf, "IMSC: 0x%x\n", reg);
+
+	reg = READL(bi, BSC_RIS);
+	ret += sprintf(buf, "RIS: 0x%x\n", reg);
+
+	reg = READL(bi, BSC_MIS);
+	ret += sprintf(buf, "MIS: 0x%x\n", reg);
+
+	reg = READL(bi, BSC_ICR);
+	ret += sprintf(buf, "ICR: 0x%x\n", reg);
+	spin_unlock(&bi->lock);
+	
+	return ret;
+	
+}
+
+static DEVICE_ATTR_RO(debug);
+static struct attribute *i2c_slave_attrs[ ] = {
+	&dev_attr_debug.attr,
+	&dev_attr_address.attr,
+	NULL,
+};
+#else
+static struct attribute *i2c_slave_attrs[ ] = {
+	&dev_attr_address.attr,
+	NULL,
+};
+#endif
+ATTRIBUTE_GROUPS(i2c_slave);
+
+
+
+/*-------------------------------------------------------------------------------------------------------------------------------*/
 static const struct file_operations i2c_slave_fops = {
 	.owner = THIS_MODULE,
 	.open = i2c_slave_open,
@@ -327,6 +372,7 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
      		err = PTR_ERR(i2c_slave_class);
      		goto out_delete_cdev;
   	}
+	i2c_slave_class->dev_groups = i2c_slave_groups;
   	cdev_init(&bi->cdev, &i2c_slave_fops);
   	err = cdev_add(&bi->cdev, dev_number, 1);
   	if(err){
@@ -349,7 +395,8 @@ static int bcm2835_i2c_slave_probe(struct platform_device *pdev)
 	}
 
 	bi->irq = irq;
-	
+	bi->slave_address = slave_add;
+
 	err = request_irq(irq, bcm2835_i2c_slave_interrupt, IRQF_SHARED,
 			dev_name(&pdev->dev), bi);
 	if (err) {
