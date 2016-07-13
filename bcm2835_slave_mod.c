@@ -84,8 +84,7 @@ static inline void bcm2835_bsc_slave_fifo_fill(struct bcm2835_i2c_slave  *bi)
 		smp_rmb();
 		printk(KERN_INFO "data stored : %c\n", bi->tx_buff.buf[bi->tx_buff.tail]);
 		INCREMENT_BUFF_CURSOR(bi->tx_buff.tail, 1);
-		
-	}
+		}
 	spin_unlock(&bi->tx_lock);
 }
 
@@ -143,8 +142,7 @@ static ssize_t i2c_slave_write(struct file *file, const char __user *buf, size_t
 		if(copy_from_user(&bi->tx_buff.buf[0], buf + length, effective_count - length) == 0) {
 			res += effective_count - length;
 		}
-	}
-	
+	}	
 	INCREMENT_BUFF_CURSOR(bi->tx_buff.head, res);
 	reg = READL(bi, BSC_IMSC);
 	reg |= BSC_IMSC_TXIM;
@@ -224,7 +222,7 @@ static long i2c_slave_ioctl(struct file *file, unsigned int cmd, unsigned long a
 static ssize_t address_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct bcm2835_i2c_slave *bi = dev_get_drvdata(dev->parent);
-	return sprintf(buf, "%x\n", bi->slave_address);
+	return sprintf(buf, "0x%x\n", bi->slave_address);
 }
 static ssize_t address_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
 {
@@ -232,12 +230,10 @@ static ssize_t address_store(struct device *dev, struct device_attribute *attr, 
 	int ret;
 	struct bcm2835_i2c_slave *bi = dev_get_drvdata(dev->parent);
 	ret = kstrtol(buf, 0, &tmp);
-	if(size != 4 || ret < 0 || tmp > 0x7F) {
+	if(ret < 0 || tmp > 0x7F) {
 		printk(KERN_INFO "Invalid address :  Address must be passed under hexadecimal form\n0x00 -- 0x7F");
 		return -EINVAL;
-	}
-	else
-	{		
+	} else {		
 		bi->slave_address = tmp;
 		WRITEL(bi, BSC_SLV, bi->slave_address);
 	}
