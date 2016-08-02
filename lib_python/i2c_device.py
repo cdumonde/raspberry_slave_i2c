@@ -9,14 +9,14 @@ class i2c_dev:
 		self.address = address
 		self.bus = smbus
 
-	def __dev_read(self, reg_data):
+	def _dev_read(self, reg_data):
 		try:
-			return self.bus.read_i2c_block_data(i2c_dev.address, reg_data)
+			return self.bus.read_i2c_block_data(self.address, reg_data)
 		except:
 			return -1
 
-	def __dev_write(self, reg_data, data):
+	def _dev_write(self, reg_data, data):
 		try:
-			return self.bus.write_i2c_block_data(i2c_dev.address, reg_data, data)
+			return self.bus.write_i2c_block_data(self.address, reg_data, data)
 		except:
 			return -1
