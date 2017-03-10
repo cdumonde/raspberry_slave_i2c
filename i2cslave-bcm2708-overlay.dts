@@ -18,7 +18,8 @@
 			compatible = "brcm,bcm2835-i2c-slave";
 			reg = <0x7e214000 0x1000>;
 			interrupts = <2 11>;
-			clocks = <&clk_core>;
+			/*clocks = <&clk_core>;*/
+			clocks = <&clocks>;
 			clock-frequency = <100000>;
 			#address-cells = <1>;
 			#size-cells = <1>;
